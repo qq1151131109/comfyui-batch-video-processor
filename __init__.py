@@ -49,7 +49,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartVideoCutterWithAudio": "🎧 音频时长匹配器",
 }
 
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
+
 # 指定前端扩展目录
 WEB_DIRECTORY = "js"
-
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
