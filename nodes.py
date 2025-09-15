@@ -49,25 +49,39 @@ def smart_concatenate_videos(video_paths: list, output_path: str) -> bool:
             concat_file = f.name
         
         try:
-            # 方法1：流拷贝模式（超快速，不重编码）
-            copy_start = time.time()
-            print(f"🚀 尝试快速拼接: {os.path.basename(output_path)}")
-            try:
-                (
-                    ffmpeg
-                    .input(concat_file, format='concat', safe=0)
-                    .output(output_path, c='copy')
-                    .overwrite_output()
-                    .run(quiet=True, capture_stdout=True, capture_stderr=True)
-                )
-                copy_time = time.time() - copy_start
-                speed = total_size / copy_time if copy_time > 0 else 0
-                print(f"✅ 快速拼接成功！用时: {copy_time:.1f}s, 速度: {speed:.1f}MB/s")
-                return True
-            except ffmpeg.Error:
-                print(f"⚠️ 快速拼接失败，使用重编码模式...")
-                if os.path.exists(output_path):
-                    os.remove(output_path)
+            # 先检查视频兼容性
+            compatible = _check_video_compatibility(video_paths)
+            
+            if compatible:
+                # 方法1：流拷贝模式（超快速，不重编码）
+                copy_start = time.time()
+                print(f"🚀 尝试快速拼接: {os.path.basename(output_path)}")
+                try:
+                    result = (
+                        ffmpeg
+                        .input(concat_file, format='concat', safe=0)
+                        .output(output_path, c='copy')
+                        .overwrite_output()
+                        .run(quiet=True, capture_stdout=True, capture_stderr=True)
+                    )
+                    
+                    # 验证输出文件的完整性
+                    if _verify_output_integrity(output_path, len(video_paths)):
+                        copy_time = time.time() - copy_start
+                        speed = total_size / copy_time if copy_time > 0 else 0
+                        print(f"✅ 快速拼接成功！用时: {copy_time:.1f}s, 速度: {speed:.1f}MB/s")
+                        return True
+                    else:
+                        print(f"⚠️ 快速拼接输出验证失败，使用重编码模式...")
+                        if os.path.exists(output_path):
+                            os.remove(output_path)
+                        
+                except ffmpeg.Error as e:
+                    print(f"⚠️ 快速拼接失败，使用重编码模式...")
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+            else:
+                print(f"⚠️ 视频不兼容，直接使用重编码模式...")
             
             # 方法2：重编码模式（硬件加速优先）
             encode_start = time.time()
@@ -116,16 +130,58 @@ def smart_concatenate_videos(video_paths: list, output_path: str) -> bool:
                     output_params.update({
                         'acodec': 'aac',
                         'ar': 44100,
-                        'ac': 2
+                        'ac': 2,
+                        # 确保视频编码正确
+                        'pix_fmt': 'yuv420p',  # 兼容性像素格式
+                        'shortest': None,  # 以最短的流为准
                     })
                     
-                    (
-                        ffmpeg
-                        .input(concat_file, format='concat', safe=0)
-                        .output(output_path, **output_params)
-                        .overwrite_output()
-                        .run(quiet=True, capture_stdout=True, capture_stderr=True)
-                    )
+                    print(f"🔧 编码参数: {output_params}")
+                    
+                    # 使用filter_complex方法进行拼接（借鉴reference实现）
+                    print(f"🔄 使用filter_complex方法拼接...")
+                    
+                    # 获取第一个视频的分辨率作为标准
+                    first_probe = ffmpeg.probe(video_paths[0])
+                    first_video_stream = next(s for s in first_probe['streams'] if s['codec_type'] == 'video')
+                    target_width = int(first_video_stream['width'])
+                    target_height = int(first_video_stream['height'])
+                    print(f"🎯 统一分辨率为: {target_width}x{target_height}")
+                    
+                    # 构建输入流列表
+                    input_streams = []
+                    for video_path in video_paths:
+                        input_streams.append(ffmpeg.input(video_path, **{'fflags': '+ignidx+igndts'}))
+                    
+                    # 准备视频和音频流（标准化处理）
+                    video_inputs = []
+                    audio_inputs = []
+                    for stream in input_streams:
+                        # 标准化视频流：统一分辨率、帧率、SAR
+                        video_stream = (stream.video
+                                       .filter('scale', target_width, target_height, flags='lanczos')
+                                       .filter('setsar', '1')  # 统一SAR
+                                       .filter('fps', fps=30))  # 统一帧率
+                        video_inputs.append(video_stream)
+                        audio_inputs.append(stream.audio)
+                    
+                    # 使用concat滤镜
+                    concat_v = ffmpeg.filter(video_inputs, 'concat', n=len(video_inputs), v=1, a=0)
+                    concat_a = ffmpeg.filter(audio_inputs, 'concat', n=len(audio_inputs), v=0, a=1)
+                    
+                    # 输出参数（去除不需要的参数）
+                    clean_params = {k: v for k, v in output_params.items() if k not in ['shortest']}
+                    
+                    result = ffmpeg.output(
+                        concat_v,
+                        concat_a,
+                        output_path,
+                        **clean_params
+                    ).overwrite_output().run(quiet=True, capture_stdout=True, capture_stderr=True)
+                    
+                    # 验证输出文件
+                    if not _verify_output_integrity(output_path, len(video_paths)):
+                        raise ffmpeg.Error("输出文件验证失败")
                     
                     encode_time = time.time() - encode_start
                     speed = total_size / encode_time if encode_time > 0 else 0
@@ -154,6 +210,105 @@ def smart_concatenate_videos(video_paths: list, output_path: str) -> bool:
         
     except Exception as e:
         print(f"❌ 视频拼接失败: {e}")
+        return False
+
+
+def _check_video_compatibility(video_paths: list) -> bool:
+    """检查视频文件兼容性 - 用于判断是否可以使用流拷贝模式"""
+    try:
+        import ffmpeg
+        
+        video_info = []
+        for video_path in video_paths:
+            try:
+                probe = ffmpeg.probe(video_path)
+                video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
+                audio_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'audio'), None)
+                
+                if not video_stream:
+                    print(f"⚠️ 视频 {os.path.basename(video_path)} 没有视频流")
+                    return False
+                
+                info = {
+                    'codec': video_stream.get('codec_name'),
+                    'width': video_stream.get('width'),
+                    'height': video_stream.get('height'),
+                    'fps': eval(video_stream.get('r_frame_rate', '25/1')),
+                    'audio_codec': audio_stream.get('codec_name') if audio_stream else None,
+                    'audio_sample_rate': audio_stream.get('sample_rate') if audio_stream else None,
+                }
+                video_info.append(info)
+                
+            except Exception as e:
+                print(f"⚠️ 无法获取 {os.path.basename(video_path)} 的视频信息: {e}")
+                return False
+        
+        # 检查所有视频是否有相同的关键属性
+        if len(video_info) < 2:
+            return True
+        
+        first_video = video_info[0]
+        for i, info in enumerate(video_info[1:], 1):
+            if (info['codec'] != first_video['codec'] or
+                info['width'] != first_video['width'] or 
+                info['height'] != first_video['height'] or
+                abs(info['fps'] - first_video['fps']) > 0.1):
+                print(f"⚠️ 视频不兼容 - 第{i+1}个视频参数不匹配:")
+                print(f"   第1个: {first_video['codec']} {first_video['width']}x{first_video['height']} {first_video['fps']:.1f}fps")
+                print(f"   第{i+1}个: {info['codec']} {info['width']}x{info['height']} {info['fps']:.1f}fps")
+                return False
+                
+        print(f"✅ 所有视频兼容 ({first_video['codec']} {first_video['width']}x{first_video['height']})")
+        return True
+        
+    except Exception as e:
+        print(f"⚠️ 兼容性检查失败: {e}")
+        return False
+
+
+def _verify_output_integrity(output_path: str, expected_segments: int) -> bool:
+    """验证输出文件完整性"""
+    try:
+        import ffmpeg
+        
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            print(f"⚠️ 输出文件不存在或为空")
+            return False
+            
+        # 详细检查文件流信息
+        probe = ffmpeg.probe(output_path)
+        video_streams = [s for s in probe['streams'] if s['codec_type'] == 'video']
+        audio_streams = [s for s in probe['streams'] if s['codec_type'] == 'audio']
+        
+        print(f"🔍 文件流分析:")
+        print(f"   视频流数量: {len(video_streams)}")
+        print(f"   音频流数量: {len(audio_streams)}")
+        
+        if not video_streams:
+            print(f"❌ 输出文件没有视频流！")
+            return False
+            
+        video_stream = video_streams[0]
+        print(f"   视频编码: {video_stream.get('codec_name')}")
+        print(f"   分辨率: {video_stream.get('width')}x{video_stream.get('height')}")
+        print(f"   帧率: {video_stream.get('r_frame_rate')}")
+        
+        if audio_streams:
+            audio_stream = audio_streams[0]
+            print(f"   音频编码: {audio_stream.get('codec_name')}")
+            print(f"   采样率: {audio_stream.get('sample_rate')}")
+        
+        # 检查视频时长是否合理（应该大于0）
+        duration = float(probe.get('format', {}).get('duration', 0))
+        if duration <= 0:
+            print(f"❌ 输出文件时长异常: {duration}s")
+            return False
+            
+        print(f"✅ 输出文件验证通过 (时长: {duration:.1f}s)")
+        return True
+        
+    except Exception as e:
+        print(f"⚠️ 输出文件验证失败: {e}")
         return False
 
 
