@@ -98,6 +98,7 @@ class BatchVideoLoader(io.ComfyNode):
                 io.String.Output("output_folder_path", display_name="文件夹路径"),
                 io.Int.Output("file_count", display_name="文件数量"),
                 io.String.Output("file_list", display_name="文件列表"),
+                io.String.Output("file_paths", display_name="文件路径列表"),  # 新增：实际文件路径
                 io.String.Output("preview_file", display_name="预览文件"),
                 io.Video.Output("preview_video", display_name="视频预览"),
                 io.Audio.Output("preview_audio", display_name="音频预览"),
@@ -135,7 +136,7 @@ class BatchVideoLoader(io.ComfyNode):
                     empty_video = VideoFromFile(python_io.BytesIO(b''))
                     empty_audio = {"waveform": torch.zeros((1, 1, 1), dtype=torch.float32), "sample_rate": 44100}
                     empty_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
-                    return io.NodeOutput("", 0, file_list, "", empty_video, empty_audio, empty_image)
+                    return io.NodeOutput("", 0, file_list, "", "", empty_video, empty_audio, empty_image)
             
             # 优先级2: 查找最新的上传会话
             else:
@@ -163,9 +164,8 @@ class BatchVideoLoader(io.ComfyNode):
             # 扫描目标文件夹中的素材文件 (视频+音频+图像)
             print(f"📁 开始扫描目录: {target_folder}")
             media_result = scan_media_files(target_folder)
-            media_files = []
-            for file_type, files in media_result.items():
-                media_files.extend(files)
+            # 修复：直接使用 'all' 键避免重复，或者手动去重
+            media_files = list(set(media_result.get('all', [])))  # 使用set去重
             print(f"📋 找到 {len(media_files)} 个媒体文件: {[os.path.basename(f) for f in media_files[:5]]}")
             if len(media_files) > 5:
                 print(f"    ... 还有 {len(media_files) - 5} 个文件")
@@ -185,7 +185,7 @@ class BatchVideoLoader(io.ComfyNode):
                 empty_video = VideoFromFile(python_io.BytesIO(b''))
                 empty_audio = {"waveform": torch.zeros((1, 1, 1), dtype=torch.float32), "sample_rate": 44100}
                 empty_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
-                return io.NodeOutput(target_folder, 0, file_list, "", empty_video, empty_audio, empty_image)
+                return io.NodeOutput(target_folder, 0, file_list, "", "", empty_video, empty_audio, empty_image)
             
             # 生成详细的文件列表
             print(f"📋 找到 {len(media_files)} 个媒体文件")
@@ -285,9 +285,12 @@ class BatchVideoLoader(io.ComfyNode):
             
             file_list = "\n".join(file_list_parts)
             
+            # 生成文件路径列表（用|分隔）
+            file_paths = "|".join(media_files) if media_files else ""
+            
             print(f"✅ BatchVideoLoader完成: {len(media_files)} 个文件，预览: {os.path.basename(preview_file) if preview_file else '无'}")
             
-            return io.NodeOutput(target_folder, len(media_files), file_list, preview_file, preview_video, preview_audio, preview_image)
+            return io.NodeOutput(target_folder, len(media_files), file_list, file_paths, preview_file, preview_video, preview_audio, preview_image)
             
         except Exception as e:
             error_msg = f"❌ 批量素材加载失败: {str(e)}"
@@ -339,7 +342,7 @@ class BatchVideoLoader(io.ComfyNode):
         empty_video = VideoFromFile(python_io.BytesIO(b''))
         empty_audio = {"waveform": torch.zeros((1, 1, 1), dtype=torch.float32), "sample_rate": 44100}
         empty_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
-        return io.NodeOutput("", 0, file_list, "", empty_video, empty_audio, empty_image)
+        return io.NodeOutput("", 0, file_list, "", "", empty_video, empty_audio, empty_image)
 
 
 class RandomVideoConcatenator(io.ComfyNode):
@@ -668,6 +671,195 @@ class TraverseVideoConcatenator(io.ComfyNode):
 
 
 
+class FileListConcatenator(io.ComfyNode):
+    """🎯 文件列表拼接器 - 直接使用文件列表进行拼接"""
+    
+    @classmethod
+    def define_schema(cls):
+        # 创建20个文件列表输入
+        inputs = []
+        for i in range(1, 21):
+            optional = i > 2  # 前两个必填，其他可选
+            inputs.append(io.String.Input(
+                f"file_list{i}", 
+                optional=optional, 
+                tooltip=f"文件列表{i}{'(可选)' if optional else ''} - 用|分隔的文件路径"
+            ))
+        
+        inputs.extend([
+            io.Int.Input(
+                "traverse_list_index", 
+                default=1, 
+                min=1, 
+                max=20,
+                tooltip="要遍历的文件列表序号"
+            ),
+            io.String.Input(
+                "output_prefix", 
+                default="文件拼接", 
+                tooltip="输出前缀"
+            ),
+        ])
+        
+        return io.Schema(
+            node_id="FileListConcatenator",
+            display_name="🎯 文件列表拼接器",
+            category="batch_video", 
+            description="直接使用输入的文件列表进行视频拼接，遍历指定列表，其他列表随机选择",
+            inputs=inputs,
+            outputs=[
+                io.String.Output("output_folder", display_name="输出文件夹"),
+                io.String.Output("output_file_paths", display_name="输出文件路径列表"),
+                io.Int.Output("generated_count", display_name="生成数量"),
+                io.String.Output("concatenation_summary", display_name="拼接摘要"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, traverse_list_index: int = 1, output_prefix: str = "文件拼接", **kwargs) -> io.NodeOutput:
+        import os
+        import random
+        import time
+        from pathlib import Path
+        
+        print(f"🎯 FileListConcatenator执行开始，遍历列表序号: {traverse_list_index}, 输出前缀: '{output_prefix}'")
+        
+        try:
+            # 收集有效的文件列表
+            file_lists = {}
+            for i in range(1, 21):
+                list_key = f"file_list{i}"
+                if list_key in kwargs and kwargs[list_key]:
+                    file_paths_str = kwargs[list_key]
+                    # 解析文件路径并验证存在
+                    files = [f.strip() for f in file_paths_str.split('|') if f.strip() and os.path.exists(f.strip())]
+                    if files:
+                        file_lists[i-1] = files  # 转为0索引
+                        print(f"📄 收集到文件列表{i}: {len(files)} 个文件")
+            
+            if len(file_lists) < 2:
+                error_msg = f"错误：至少需要2个文件列表，但只收集到{len(file_lists)}个有效列表"
+                print(f"❌ {error_msg}")
+                return io.NodeOutput("", "", 0, error_msg)
+            
+            if (traverse_list_index - 1) not in file_lists:
+                error_msg = f"错误：遍历文件列表序号{traverse_list_index}无效或为空"
+                print(f"❌ {error_msg}")
+                return io.NodeOutput("", "", 0, error_msg)
+            
+            print(f"📊 总共收集到 {len(file_lists)} 个有效文件列表")
+            
+            # 创建输出文件夹
+            output_dir = folder_paths.get_output_directory()
+            timestamp = int(time.time())
+            output_folder = os.path.join(output_dir, "processed_batches", f"{timestamp}_{output_prefix}_concatenated")
+            os.makedirs(output_folder, exist_ok=True)
+            
+            successful_count = 0
+            output_files = []
+            summary_lines = []
+            
+            # 遍历+随机模式：遍历指定列表，其他列表随机选择
+            traverse_files = file_lists[traverse_list_index - 1]  # 转换为0索引
+            other_lists = {k: v for k, v in file_lists.items() if k != traverse_list_index - 1}
+            
+            print(f"开始遍历文件拼接，遍历列表{traverse_list_index}({len(traverse_files)}个文件)，使用{len(file_lists)}个文件列表")
+            
+            for i, traverse_file in enumerate(traverse_files):
+                try:
+                    selected_files = [traverse_file]
+                    
+                    # 从其他列表随机选择
+                    for list_idx in sorted(other_lists.keys()):
+                        selected_files.append(random.choice(other_lists[list_idx]))
+                    
+                    output_filename = f"list_concat_{i+1:04d}.mp4"
+                    output_path = os.path.join(output_folder, output_filename)
+                    
+                    print(f"🔄 拼接 ({i+1}/{len(traverse_files)}): {len(selected_files)} 个文件")
+                    
+                    if cls._concatenate_videos(selected_files, output_path):
+                        successful_count += 1
+                        output_files.append(output_path)
+                        file_size = os.path.getsize(output_path)
+                        print(f"✓ 完成拼接 {i+1}/{len(traverse_files)}: {output_filename} ({file_size} bytes)")
+                        
+                        # 记录拼接的文件名
+                        file_names = [Path(f).stem for f in selected_files]
+                        summary_lines.append(f"✓ {' + '.join(file_names)}")
+                    else:
+                        print(f"❌ 拼接失败 {i+1}/{len(traverse_files)}")
+                        file_names = [Path(f).stem for f in selected_files]
+                        summary_lines.append(f"❌ {' + '.join(file_names)} (拼接失败)")
+                
+                except Exception as e:
+                    print(f"✗ 拼接失败 {i+1}: {e}")
+                    summary_lines.append(f"❌ 文件{i+1} (错误: {str(e)})")
+            
+            # 生成摘要
+            output_file_paths = "|".join(output_files) if output_files else ""
+            concatenation_summary = f"""文件列表拼接完成！
+输出文件夹: {output_folder}
+遍历列表: {traverse_list_index} (共{len(traverse_files)}个文件)
+使用列表数: {len(file_lists)}
+成功生成: {successful_count} 个视频
+详情:
+{chr(10).join(summary_lines)}"""
+            
+            print(f"✅ 拼接完成: {successful_count}/{len(traverse_files)} 个视频成功")
+            
+            return io.NodeOutput(output_folder, output_file_paths, successful_count, concatenation_summary)
+            
+        except Exception as e:
+            error_msg = f"❌ 文件列表拼接失败: {str(e)}"
+            print(error_msg)
+            import traceback
+            print(f"详细错误: {traceback.format_exc()}")
+            return io.NodeOutput("", "", 0, error_msg)
+    
+    @staticmethod
+    def _concatenate_videos(video_paths: list[str], output_path: str) -> bool:
+        """拼接多个视频文件 - 使用concat demuxer方法"""
+        try:
+            import ffmpeg
+            import tempfile
+            import os
+            
+            if len(video_paths) < 2:
+                return False
+            
+            # 使用concat demuxer方法，创建临时文件列表
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                for video_path in video_paths:
+                    f.write(f"file '{video_path}'\n")
+                concat_file = f.name
+            
+            try:
+                # 使用concat demuxer进行拼接
+                (
+                    ffmpeg
+                    .input(concat_file, format='concat', safe=0)
+                    .output(output_path, vcodec='libx264', acodec='aac')
+                    .overwrite_output()
+                    .run(quiet=True)
+                )
+                
+                # 清理临时文件
+                os.unlink(concat_file)
+                return True
+                
+            except Exception as e:
+                # 清理临时文件
+                if os.path.exists(concat_file):
+                    os.unlink(concat_file)
+                print(f"拼接视频失败 {output_path}: {e}")
+                return False
+                
+        except Exception as e:
+            print(f"拼接视频失败 {output_path}: {e}")
+            return False
+
+
 class BatchVideoCutter(io.ComfyNode):
     """批量视频切分器 - 简化版"""
     
@@ -682,6 +874,11 @@ class BatchVideoCutter(io.ComfyNode):
                 io.String.Input(
                     "input_folder", 
                     tooltip="输入视频文件夹路径"
+                ),
+                io.String.Input(
+                    "file_paths",
+                    optional=True,
+                    tooltip="文件路径列表（可选，如提供则优先使用）"
                 ),
                 io.Float.Input(
                     "cut_duration", 
@@ -699,26 +896,42 @@ class BatchVideoCutter(io.ComfyNode):
             ],
             outputs=[
                 io.String.Output("output_folder", display_name="文件夹路径"),
+                io.String.Output("output_file_paths", display_name="输出文件路径列表"),
                 io.Int.Output("total_segments", display_name="总片段数"),
                 io.String.Output("summary", display_name="处理摘要"),
             ],
         )
 
     @classmethod
-    def execute(cls, input_folder: str, cut_duration: float, output_prefix: str) -> io.NodeOutput:
+    def execute(cls, input_folder: str, file_paths: str = "", cut_duration: float = 30.0, output_prefix: str = "已处理") -> io.NodeOutput:
         print(f"✂️ BatchVideoCutter执行开始，输入文件夹: '{input_folder}', 切分时长: {cut_duration}秒")
         
         # 获取输出目录
         output_dir = folder_paths.get_output_directory()
         output_folder = create_output_folder(output_dir, output_prefix)
         
-        # 扫描输入文件夹
-        if not os.path.exists(input_folder):
-            return io.NodeOutput(output_folder, 0, f"错误：输入文件夹不存在")
-        
-        # 只扫描视频文件 (BatchVideoCutter只能处理视频)
-        media_result = scan_media_files(input_folder)
-        video_files = media_result.get('video', [])
+        # 优先使用文件路径列表，否则扫描文件夹
+        video_files = []
+        if file_paths and file_paths.strip():
+            # 解析文件路径列表
+            all_files = [f.strip() for f in file_paths.split('|') if f.strip()]
+            # 过滤出视频文件
+            video_extensions = ['mp4', 'avi', 'mov', 'mkv', 'flv', 'wmv', 'm4v', 'webm']
+            for file_path in all_files:
+                if os.path.exists(file_path):
+                    ext = os.path.splitext(file_path)[1].lower().lstrip('.')
+                    if ext in video_extensions:
+                        video_files.append(file_path)
+            print(f"📄 使用文件路径列表，找到 {len(video_files)} 个视频文件")
+        else:
+            # 扫描输入文件夹
+            if not os.path.exists(input_folder):
+                return io.NodeOutput(output_folder, 0, f"错误：输入文件夹不存在")
+            
+            # 只扫描视频文件 (BatchVideoCutter只能处理视频)
+            media_result = scan_media_files(input_folder, ['video'])  # 只扫描视频
+            video_files = media_result.get('video', [])
+            print(f"📁 扫描文件夹，找到 {len(video_files)} 个视频文件")
         
         if not video_files:
             return io.NodeOutput(output_folder, 0, f"未找到视频文件")
@@ -730,6 +943,7 @@ class BatchVideoCutter(io.ComfyNode):
         
         total_segments = 0
         processed_videos = 0
+        output_files = []  # 收集输出文件路径
         
         # 简化处理：单线程，基本切分
         for i, video_file in enumerate(video_files, 1):
@@ -737,12 +951,13 @@ class BatchVideoCutter(io.ComfyNode):
             print(f"🔄 正在处理 ({i}/{len(video_files)}): {filename}")
             
             try:
-                segments_count = cls._process_single_video_simple(
+                segments_count, segment_files = cls._process_single_video_simple(
                     video_file, cut_duration, output_folder
                 )
                 if segments_count > 0:
                     total_segments += segments_count
                     processed_videos += 1
+                    output_files.extend(segment_files)  # 添加输出文件
                     print(f"✓ 完成: {filename} → {segments_count} 个片段")
                 else:
                     print(f"⚠️ 跳过: {filename} (时长不足或处理失败)")
@@ -751,17 +966,20 @@ class BatchVideoCutter(io.ComfyNode):
                 import traceback
                 print(f"详细错误: {traceback.format_exc()}")
         
+        # 生成输出文件路径列表
+        output_file_paths = "|".join(output_files) if output_files else ""
+        
         summary = f"""处理完成！
 输出: {output_folder}
 处理: {processed_videos}/{len(video_files)} 个视频文件
 总段数: {total_segments}
 时长: {cut_duration}秒/段"""
         
-        return io.NodeOutput(output_folder, total_segments, summary)
+        return io.NodeOutput(output_folder, output_file_paths, total_segments, summary)
     
     @staticmethod
-    def _process_single_video_simple(video_path: str, cut_duration: float, output_folder: str) -> int:
-        """简化的单视频处理"""
+    def _process_single_video_simple(video_path: str, cut_duration: float, output_folder: str) -> tuple[int, list[str]]:
+        """简化的单视频处理，返回(片段数, 文件路径列表)"""
         video_name = Path(video_path).stem
         filename = os.path.basename(video_path)
         
@@ -771,12 +989,12 @@ class BatchVideoCutter(io.ComfyNode):
         
         if video_duration < cut_duration:
             print(f"    ⚠️ 视频时长({video_duration:.2f}s) < 切分时长({cut_duration}s)，跳过")
-            return 0
+            return 0, []
         
         num_segments = int(video_duration // cut_duration)
         if num_segments == 0:
             print(f"    ⚠️ 无法生成片段，跳过")
-            return 0
+            return 0, []
         
         print(f"    📊 计划生成 {num_segments} 个片段，每段 {cut_duration} 秒")
         
@@ -785,6 +1003,7 @@ class BatchVideoCutter(io.ComfyNode):
         print(f"    📁 输出目录: {video_output_dir}")
         
         segments_created = 0
+        created_files = []  # 收集成功生成的文件路径
         
         # 简单切分（不添加结尾视频）
         import ffmpeg
@@ -814,6 +1033,7 @@ class BatchVideoCutter(io.ComfyNode):
                 # 验证输出文件
                 if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                     segments_created += 1
+                    created_files.append(output_path)  # 添加成功文件到列表
                     output_size = os.path.getsize(output_path)
                     print(f"    ✓ 片段 {i+1} 完成: {output_filename} ({output_size} bytes)")
                 else:
@@ -823,7 +1043,7 @@ class BatchVideoCutter(io.ComfyNode):
                 print(f"    ❌ 切分失败 {output_filename}: {str(e)}")
         
         print(f"    📋 {filename} 处理完成: {segments_created}/{num_segments} 个片段成功")
-        return segments_created
+        return segments_created, created_files
 
 
 class VideoStaticCleaner(io.ComfyNode):
@@ -4265,6 +4485,176 @@ class BatchVideoDownloader(io.ComfyNode):
                 "type": "output"
             }],
             # 添加文本格式，包含可点击的HTML链接
+            "text": [f'<a href="{download_url}" download="{archive_filename}" style="color: #4CAF50; text-decoration: underline; font-weight: bold;">🔗 点击下载 {archive_filename}</a>']
+        }
+        
+        return io.NodeOutput(download_url, archive_info, ui=ui_output)
+
+
+class FileListDownloader(io.ComfyNode):
+    """🎯 文件列表下载器 - 基于文件列表精确下载"""
+    
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="FileListDownloader",
+            display_name="文件列表下载器",
+            category="batch_video",
+            description="基于文件列表精确下载指定文件",
+            inputs=[
+                io.String.Input(
+                    "file_paths", 
+                    tooltip="文件路径列表（使用|分隔）"
+                ),
+                io.String.Input(
+                    "archive_name", 
+                    default="文件列表下载", 
+                    tooltip="压缩包名称"
+                ),
+                io.Boolean.Input(
+                    "preserve_structure",
+                    default=True,
+                    tooltip="是否保持文件目录结构"
+                ),
+            ],
+            outputs=[
+                io.String.Output("download_path", display_name="下载路径"),
+                io.String.Output("archive_info", display_name="压缩包信息"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, file_paths: str, archive_name: str, preserve_structure: bool) -> io.NodeOutput:
+        print(f"🎯 FileListDownloader执行开始，压缩包名: '{archive_name}'")
+        
+        if not file_paths or not file_paths.strip():
+            error_msg = "错误：文件路径列表为空，请检查上游节点输出"
+            print(f"❌ {error_msg}")
+            return io.NodeOutput("", error_msg)
+        
+        # 解析文件列表
+        file_list = [path.strip() for path in file_paths.split("|") if path.strip()]
+        if not file_list:
+            error_msg = "错误：解析后的文件列表为空"
+            print(f"❌ {error_msg}")
+            return io.NodeOutput("", error_msg)
+        
+        print(f"📋 解析到 {len(file_list)} 个文件路径")
+        
+        # 过滤存在的文件
+        existing_files = []
+        missing_files = []
+        
+        for file_path in file_list:
+            if os.path.exists(file_path):
+                existing_files.append(file_path)
+                file_size = os.path.getsize(file_path)
+                size_str = format_file_size(file_size)
+                filename = os.path.basename(file_path)
+                print(f"  ✅ {filename} ({size_str})")
+            else:
+                missing_files.append(file_path)
+                print(f"  ❌ 文件不存在: {file_path}")
+        
+        if not existing_files:
+            error_msg = f"错误：没有找到可用的文件。缺失文件数: {len(missing_files)}"
+            print(f"❌ {error_msg}")
+            return io.NodeOutput("", error_msg)
+        
+        if missing_files:
+            print(f"⚠️  跳过 {len(missing_files)} 个缺失文件，继续处理 {len(existing_files)} 个存在的文件")
+        
+        # 创建压缩包
+        print(f"🗜️ 开始创建压缩包: {archive_name}")
+        
+        import zipfile
+        from datetime import datetime
+        
+        # 直接使用output目录
+        output_dir = folder_paths.get_output_directory()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 使用英文文件名，避免编码问题
+        safe_archive_name = "file_list_result" if any(ord(c) > 127 for c in archive_name) else archive_name
+        archive_path = os.path.join(output_dir, f"{safe_archive_name}_{timestamp}.zip")
+        print(f"🐛 调试: archive_path = {archive_path}")
+        
+        file_count = 0
+        total_size = 0
+        
+        # 如果保持目录结构，找到公共父路径
+        common_base = ""
+        if preserve_structure and len(existing_files) > 1:
+            common_base = os.path.commonpath(existing_files)
+            print(f"📂 公共基础路径: {common_base}")
+        
+        with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for file_path in existing_files:
+                try:
+                    if preserve_structure and common_base:
+                        # 保持相对于公共路径的目录结构
+                        arcname = os.path.relpath(file_path, common_base)
+                    else:
+                        # 仅使用文件名，扁平化结构
+                        arcname = os.path.basename(file_path)
+                    
+                    zipf.write(file_path, arcname)
+                    file_count += 1
+                    total_size += os.path.getsize(file_path)
+                    print(f"  📦 添加: {arcname}")
+                except Exception as e:
+                    print(f"  ❌ 添加文件失败 {file_path}: {e}")
+        
+        if not os.path.exists(archive_path):
+            error_msg = "创建压缩包失败"
+            print(f"❌ {error_msg}")
+            return io.NodeOutput("", error_msg)
+        
+        archive_size = os.path.getsize(archive_path)
+        compression_ratio = (1 - archive_size / total_size) * 100 if total_size > 0 else 0
+        
+        print(f"✅ 压缩包创建成功:")
+        print(f"  📍 路径: {archive_path}")
+        print(f"  📁 文件数: {file_count} 个")
+        print(f"  📏 原始大小: {format_file_size(total_size)}")
+        print(f"  🗜️ 压缩后大小: {format_file_size(archive_size)}")
+        print(f"  💾 压缩率: {compression_ratio:.1f}%")
+        
+        # 生成ComfyUI下载信息
+        archive_filename = os.path.basename(archive_path)
+        
+        # 生成完整的下载URL
+        download_url = f"http://103.231.86.148:9000/view?filename={archive_filename}&type=output"
+        
+        archive_info = f"""✅ 文件列表下载包已创建！
+
+📍 文件名: {archive_filename}
+📁 包含文件: {file_count} 个 (来自 {len(file_list)} 个指定文件)
+📏 原始大小: {format_file_size(total_size)}
+🗜️ 压缩后大小: {format_file_size(archive_size)}
+💾 压缩率: {compression_ratio:.1f}%
+📂 目录结构: {'保持' if preserve_structure else '扁平化'}
+
+🔗 直接下载链接: 
+{download_url}
+
+📋 使用方法:
+1. 复制上面的完整链接
+2. 在浏览器新标签页中粘贴并访问
+3. 文件将自动开始下载
+
+💡 或者直接点击下方的下载链接(如果支持)"""
+        
+        if missing_files:
+            archive_info += f"\n\n⚠️  注意: {len(missing_files)} 个文件不存在，已跳过"
+        
+        # 返回ComfyUI标准格式
+        ui_output = {
+            "images": [{
+                "filename": archive_filename,
+                "subfolder": "",
+                "type": "output"
+            }],
             "text": [f'<a href="{download_url}" download="{archive_filename}" style="color: #4CAF50; text-decoration: underline; font-weight: bold;">🔗 点击下载 {archive_filename}</a>']
         }
         

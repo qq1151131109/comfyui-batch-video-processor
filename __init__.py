@@ -6,9 +6,9 @@
 from .nodes import (
     BatchVideoLoader, BatchVideoComposer, BatchVideoCutter, 
     BatchVideoCropper, VideoNormalizer, TraverseVideoConcatenator,
-    BatchVideoDownloader, VideoStaticCleaner, GameHighlightExtractor,
-    VideoThumbnailGenerator, BatchLLMGenerator, BatchTTSGenerator,
-    SmartVideoCutterWithAudio
+    FileListConcatenator, BatchVideoDownloader, FileListDownloader, VideoStaticCleaner, 
+    GameHighlightExtractor, VideoThumbnailGenerator, BatchLLMGenerator, 
+    BatchTTSGenerator, SmartVideoCutterWithAudio
 )
 
 # 节点映射
@@ -19,7 +19,9 @@ NODE_CLASS_MAPPINGS = {
     "BatchVideoCropper": BatchVideoCropper,
     "VideoNormalizer": VideoNormalizer,
     "TraverseVideoConcatenator": TraverseVideoConcatenator,
+    "FileListConcatenator": FileListConcatenator,
     "BatchVideoDownloader": BatchVideoDownloader,
+    "FileListDownloader": FileListDownloader,
     "VideoStaticCleaner": VideoStaticCleaner,
     "GameHighlightExtractor": GameHighlightExtractor,
     "VideoThumbnailGenerator": VideoThumbnailGenerator,
@@ -36,7 +38,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "BatchVideoCropper": "🔲 批量视频裁剪器",
     "VideoNormalizer": "📱 TikTok格式转换器",
     "TraverseVideoConcatenator": "🎲 批量视频拼接器",
+    "FileListConcatenator": "🎯 文件列表拼接器",
     "BatchVideoDownloader": "📥 批量视频下载器",
+    "FileListDownloader": "🎯 文件列表下载器",
     "VideoStaticCleaner": "⚡ 卡顿修复器",
     "GameHighlightExtractor": "🏆 游戏高光提取器",
     "VideoThumbnailGenerator": "🖼️ 视频缩略图生成器",
